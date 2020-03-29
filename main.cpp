@@ -29,8 +29,34 @@ int main() {
     }
     std::cout << "Bound TCP socket to 127.0.0.1:8080\n";
 
+    // Mark the bound socket as a listening socket for incoming connections.
+    if (listen(socket_fd, 16) == -1) {
+        std::cerr << "listen failed: " << std::strerror(errno) << "\n";
+        close(socket_fd);
+        return 1;
+    }
+    std::cout << "Listening on 127.0.0.1:8080\n";
+
+    // accept() blocks until a client connects and returns a new connected fd.
+    int client_fd = accept(socket_fd, nullptr, nullptr);
+    if (client_fd == -1) {
+        std::cerr << "accept failed: " << std::strerror(errno) << "\n";
+        close(socket_fd);
+        return 1;
+    }
+    std::cout << "Client connected\n";
+
+    // Close the connected socket before the longer-lived listening socket.
+    if (close(client_fd) == -1) {
+        std::cerr << "close client socket failed: " << std::strerror(errno)
+                  << '\n';
+        close(socket_fd);
+        return 1;
+    }
+
     if (close(socket_fd) == -1) {
-        std::cerr << "close failed: " << std::strerror(errno) << '\n';
+        std::cerr << "close listening socket failed: " << std::strerror(errno)
+                  << '\n';
         return 1;
     }
 
