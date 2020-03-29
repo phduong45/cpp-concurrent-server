@@ -5,6 +5,26 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+bool write_all(int fd, const char* data, std::size_t size) {
+    std::size_t total = 0;
+    while (total < size) {
+        ssize_t bytes_written = write(fd, data + total, size - total);
+
+        if (bytes_written == -1) {
+            if (errno != EINTR) {
+                return false;
+            } else {
+                continue;
+            }
+        }
+        if (bytes_written == 0) {
+            return false;
+        }
+        total += bytes_written;
+    }
+    return true;
+}
+
 int main() {
     // Create an IPv4 TCP endpoint managed by the kernel.
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -45,6 +65,29 @@ int main() {
         return 1;
     }
     std::cout << "Client connected\n";
+
+    char buffer[1024];
+
+    ssize_t bytes_read;
+    do {
+        bytes_read = read(client_fd, buffer, sizeof(buffer));
+    } while (bytes_read == -1 && errno == EINTR);
+
+    if (bytes_read > 0) {
+        if (!write_all(client_fd, buffer, bytes_read)) {
+            std::cerr << "write failed: " << std::strerror(errno) << "\n";
+            close(client_fd);
+            close(socket_fd);
+            return 1;
+        }
+    } else if (bytes_read == 0) {
+        std::cout << "Client closed\n";
+    } else {
+        std::cerr << "read failed: " << std::strerror(errno) << "\n";
+        close(client_fd);
+        close(socket_fd);
+        return 1;
+    }
 
     // Close the connected socket before the longer-lived listening socket.
     if (close(client_fd) == -1) {
