@@ -67,26 +67,36 @@ int main() {
     std::cout << "Client connected\n";
 
     char buffer[1024];
-
     ssize_t bytes_read;
-    do {
-        bytes_read = read(client_fd, buffer, sizeof(buffer));
-    } while (bytes_read == -1 && errno == EINTR);
 
-    if (bytes_read > 0) {
-        if (!write_all(client_fd, buffer, bytes_read)) {
-            std::cerr << "write failed: " << std::strerror(errno) << "\n";
-            close(client_fd);
-            close(socket_fd);
-            return 1;
+    while (true) {
+        bytes_read = read(client_fd, buffer, sizeof(buffer));
+
+        if (bytes_read > 0) {
+            if (!write_all(client_fd, buffer, bytes_read)) {
+                std::cerr << "write failed: " << std::strerror(errno) << "\n";
+                close(client_fd);
+                close(socket_fd);
+                return 1;
+            }
+            continue;
         }
-    } else if (bytes_read == 0) {
-        std::cout << "Client closed\n";
-    } else {
-        std::cerr << "read failed: " << std::strerror(errno) << "\n";
-        close(client_fd);
-        close(socket_fd);
-        return 1;
+
+        if (bytes_read == 0) {
+            std::cout << "Client closed\n";
+            break;
+        }
+
+        if (bytes_read == -1) {
+            if (errno == EINTR) {
+                continue;
+            } else {
+                std::cerr << "read failed: " << std::strerror(errno) << "\n";
+                close(client_fd);
+                close(socket_fd);
+                return 1;
+            }
+        }
     }
 
     // Close the connected socket before the longer-lived listening socket.
