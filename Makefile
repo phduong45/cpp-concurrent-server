@@ -1,16 +1,19 @@
 CXX := clang++
 CXXFLAGS := -std=c++20 -Wall -Wextra -Wpedantic
-TARGET := server
+TARGETS := server client
 
 .PHONY: all run clean
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): main.cpp
-	$(CXX) $(CXXFLAGS) main.cpp -o $(TARGET)
+server: main.cpp net_utils.cpp net_utils.h
+	$(CXX) $(CXXFLAGS) main.cpp net_utils.cpp -o server
 
-run: $(TARGET)
-	./$(TARGET)
+client: client.cpp net_utils.cpp net_utils.h
+	$(CXX) $(CXXFLAGS) client.cpp net_utils.cpp -o client
+
+run: server
+	./server
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)
