@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 int main() {
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -28,12 +29,13 @@ int main() {
         return 1;
     }
 
-    const char message[] = "hello from client\n";
-
-    if (!write_all(socket_fd, message, std::strlen(message))) {
-        std::cerr << "write failed: " << std::strerror(errno) << "\n";
-        close(socket_fd);
-        return 1;
+    std::vector<std::string> messages{"hello", "world", "bye!"};
+    for (const auto& msg : messages) {
+        if (!send_message(socket_fd, msg)) {
+            std::cout << "send failed\n";
+            close(socket_fd);
+            return 1;
+        }
     }
 
     if (shutdown(socket_fd, SHUT_WR) == -1) {
@@ -42,26 +44,9 @@ int main() {
         return 1;
     }
 
-    char buffer[1024];
-    while (true) {
-        ssize_t bytes_read = read(socket_fd, buffer, sizeof(buffer));
-
-        if (bytes_read > 0) {
-            std::cout.write(buffer, bytes_read);
-            continue;
-        }
-
-        if (bytes_read == 0) {
-            break;
-        }
-
-        if (errno == EINTR) {
-            continue;
-        }
-
-        std::cerr << "read failed: " << std::strerror(errno) << "\n";
-        close(socket_fd);
-        return 1;
+    std::string response;
+    while (read_message(socket_fd, response)) {
+        std::cout << "server response: " << response << "\n";
     }
 
     close(socket_fd);

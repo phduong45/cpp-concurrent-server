@@ -47,39 +47,16 @@ int main() {
     }
     std::cout << "Client connected\n";
 
-    char buffer[1024];
-    ssize_t bytes_read;
+    std::string message;
+    while (read_message(client_fd, message)) {
+        std::cout << "received: " << message << "\n";
 
-    while (true) {
-        bytes_read = read(client_fd, buffer, sizeof(buffer));
-
-        if (bytes_read > 0) {
-            if (!write_all(client_fd, buffer, bytes_read)) {
-                std::cerr << "write failed: " << std::strerror(errno) << "\n";
-                close(client_fd);
-                close(socket_fd);
-                return 1;
-            }
-            continue;
-        }
-
-        if (bytes_read == 0) {
-            std::cout << "Client closed\n";
+        std::string response = "echo: " + message;
+        if (!send_message(client_fd, response)) {
+            std::cout << "send failed\n";
             break;
         }
-
-        if (bytes_read == -1) {
-            if (errno == EINTR) {
-                continue;
-            } else {
-                std::cerr << "read failed: " << std::strerror(errno) << "\n";
-                close(client_fd);
-                close(socket_fd);
-                return 1;
-            }
-        }
     }
-
     // Close the connected socket before the longer-lived listening socket.
     if (close(client_fd) == -1) {
         std::cerr << "close client socket failed: " << std::strerror(errno)
