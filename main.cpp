@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
+#include <sstream>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -11,6 +12,15 @@ int main() {
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd == -1) {
         std::cerr << "socket failed: " << std::strerror(errno) << '\n';
+        return 1;
+    }
+
+    int opt = 1;
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) ==
+        -1) {
+        std::cerr << "setsockopt SO_REUSEADDR failed: " << std::strerror(errno)
+                  << '\n';
+        close(socket_fd);
         return 1;
     }
 
@@ -64,13 +74,29 @@ int main() {
     }
 
     std::cout << "received: " << request << "\n";
-    std::string_view response = "HTTP/1.1 200 OK\r\n"
-                                "Content-Length: 2\r\n"
-                                "Connection: close\r\n"
-                                "\r\n"
-                                "OK";
-    if (!write_all(client_fd, response.data(), response.size())) {
-        std::cout << "write failed\n";
+    auto line_end = request.find("\r\n");
+    std::string request_line = request.substr(0, line_end);
+    std::istringstream iss(request_line);
+    std::string method, path, version;
+
+    if (iss >> method >> path >> version) {
+        std::string_view response;
+        if (method == "GET" && path == "/health") {
+            response = "HTTP/1.1 200 OK\r\n"
+                       "Content-Length: 2\r\n"
+                       "Connection: close\r\n"
+                       "\r\n"
+                       "OK";
+        } else {
+            response = "HTTP/1.1 404 Not Found\r\n"
+                       "Content-Length: 9\r\n"
+                       "Connection: close\r\n"
+                       "\r\n"
+                       "Not Found";
+        }
+        if (!write_all(client_fd, response.data(), response.size())) {
+            std::cout << "write failed\n";
+        }
     }
 
     // Close the connected socket before the longer-lived listening
