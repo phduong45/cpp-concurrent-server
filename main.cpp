@@ -31,6 +31,29 @@ std::optional<HttpRequest> parse_request_line(std::string_view request) {
     return parsed;
 }
 
+std::optional<std::size_t> get_content_length(std::string_view headers) {
+    constexpr std::string_view key = "Content-Length:";
+
+    auto pos = headers.find(key);
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    auto value_start = pos + key.size();
+    auto line_end = headers.find("\r\n", value_start);
+    if (line_end == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    std::string value{headers.substr(value_start, line_end - value_start)};
+
+    try {
+        return static_cast<std::size_t>(std::stoul(value));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 std::string make_http_response(std::string_view status, std::string_view body) {
     std::string response;
     response += "HTTP/1.1 ";
@@ -112,16 +135,49 @@ int main() {
         request.append(buffer, bytes_read);
     }
 
+    auto header_end = request.find("\r\n\r\n");
+    std::string body;
+    bool body_complete = header_end != std::string::npos;
+
+    if (body_complete) {
+        std::string_view headers{request.data(), header_end + 4};
+        body = request.substr(header_end + 4);
+
+        if (auto content_length = get_content_length(headers)) {
+            while (body.size() < *content_length) {
+                ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
+                if (bytes_read == -1 || bytes_read == 0) {
+                    body_complete = false;
+                    break;
+                }
+
+                body.append(buffer, bytes_read);
+            }
+
+            if (body.size() > *content_length) {
+                body.resize(*content_length);
+            }
+        }
+    }
+
     std::cout << "received: " << request << "\n";
+    if (!body.empty()) {
+        std::cout << "body: " << body << "\n";
+    }
+
     auto parsed_request = parse_request_line(request);
 
-    if (!parsed_request) {
+    if (!parsed_request || !body_complete) {
         std::string response =
             make_http_response("400 Bad Request", "Bad Request");
         write_all(client_fd, response.data(), response.size());
     } else if (parsed_request->method == "GET" &&
                parsed_request->path == "/health") {
         std::string response = make_http_response("200 OK", "OK");
+        write_all(client_fd, response.data(), response.size());
+    } else if (parsed_request->method == "POST" &&
+               parsed_request->path == "/echo") {
+        std::string response = make_http_response("200 OK", body);
         write_all(client_fd, response.data(), response.size());
     } else {
         std::string response = make_http_response("404 Not Found", "Not Found");
