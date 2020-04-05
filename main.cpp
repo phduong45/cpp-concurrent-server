@@ -3,9 +3,48 @@
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
+#include <optional>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <unistd.h>
+
+struct HttpRequest {
+    std::string method;
+    std::string path;
+    std::string version;
+};
+
+std::optional<HttpRequest> parse_request_line(std::string_view request) {
+    auto line_end = request.find("\r\n");
+    if (line_end == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    std::string request_line(request.substr(0, line_end));
+    std::istringstream iss(request_line);
+    HttpRequest parsed;
+    if (!(iss >> parsed.method >> parsed.path >> parsed.version)) {
+        return std::nullopt;
+    }
+    return parsed;
+}
+
+std::string make_http_response(std::string_view status, std::string_view body) {
+    std::string response;
+    response += "HTTP/1.1 ";
+    response += status;
+    response += "\r\n";
+    response += "Content-Length: ";
+    response += std::to_string(body.size());
+    response += "\r\n";
+    response += "Connection: close\r\n";
+    response += "\r\n";
+    response += body;
+
+    return response;
+}
 
 int main() {
     // Create an IPv4 TCP endpoint managed by the kernel.
@@ -74,29 +113,19 @@ int main() {
     }
 
     std::cout << "received: " << request << "\n";
-    auto line_end = request.find("\r\n");
-    std::string request_line = request.substr(0, line_end);
-    std::istringstream iss(request_line);
-    std::string method, path, version;
+    auto parsed_request = parse_request_line(request);
 
-    if (iss >> method >> path >> version) {
-        std::string_view response;
-        if (method == "GET" && path == "/health") {
-            response = "HTTP/1.1 200 OK\r\n"
-                       "Content-Length: 2\r\n"
-                       "Connection: close\r\n"
-                       "\r\n"
-                       "OK";
-        } else {
-            response = "HTTP/1.1 404 Not Found\r\n"
-                       "Content-Length: 9\r\n"
-                       "Connection: close\r\n"
-                       "\r\n"
-                       "Not Found";
-        }
-        if (!write_all(client_fd, response.data(), response.size())) {
-            std::cout << "write failed\n";
-        }
+    if (!parsed_request) {
+        std::string response =
+            make_http_response("400 Bad Request", "Bad Request");
+        write_all(client_fd, response.data(), response.size());
+    } else if (parsed_request->method == "GET" &&
+               parsed_request->path == "/health") {
+        std::string response = make_http_response("200 OK", "OK");
+        write_all(client_fd, response.data(), response.size());
+    } else {
+        std::string response = make_http_response("404 Not Found", "Not Found");
+        write_all(client_fd, response.data(), response.size());
     }
 
     // Close the connected socket before the longer-lived listening
