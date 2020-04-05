@@ -47,17 +47,34 @@ int main() {
     }
     std::cout << "Client connected\n";
 
-    std::string message;
-    while (read_message(client_fd, message)) {
-        std::cout << "received: " << message << "\n";
+    std::string request;
+    char buffer[1024];
 
-        std::string response = "echo: " + message;
-        if (!send_message(client_fd, response)) {
-            std::cout << "send failed\n";
+    while (request.find("\r\n\r\n") == std::string::npos) {
+        ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
+        if (bytes_read == -1) {
             break;
         }
+
+        if (bytes_read == 0) {
+            break;
+        }
+
+        request.append(buffer, bytes_read);
     }
-    // Close the connected socket before the longer-lived listening socket.
+
+    std::cout << "received: " << request << "\n";
+    std::string_view response = "HTTP/1.1 200 OK\r\n"
+                                "Content-Length: 2\r\n"
+                                "Connection: close\r\n"
+                                "\r\n"
+                                "OK";
+    if (!write_all(client_fd, response.data(), response.size())) {
+        std::cout << "write failed\n";
+    }
+
+    // Close the connected socket before the longer-lived listening
+    // socket.
     if (close(client_fd) == -1) {
         std::cerr << "close client socket failed: " << std::strerror(errno)
                   << '\n';
