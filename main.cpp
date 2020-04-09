@@ -69,56 +69,7 @@ std::string make_http_response(std::string_view status, std::string_view body) {
     return response;
 }
 
-int main() {
-    // Create an IPv4 TCP endpoint managed by the kernel.
-    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_fd == -1) {
-        std::cerr << "socket failed: " << std::strerror(errno) << '\n';
-        return 1;
-    }
-
-    int opt = 1;
-    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) ==
-        -1) {
-        std::cerr << "setsockopt SO_REUSEADDR failed: " << std::strerror(errno)
-                  << '\n';
-        close(socket_fd);
-        return 1;
-    }
-
-    // Restrict the first project stage to clients running on this machine.
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(8080);
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    int result = bind(socket_fd, reinterpret_cast<const sockaddr*>(&address),
-                      sizeof(address));
-
-    if (result == -1) {
-        std::cerr << "bind failed: " << std::strerror(errno) << '\n';
-        close(socket_fd);
-        return 1;
-    }
-    std::cout << "Bound TCP socket to 127.0.0.1:8080\n";
-
-    // Mark the bound socket as a listening socket for incoming connections.
-    if (listen(socket_fd, 16) == -1) {
-        std::cerr << "listen failed: " << std::strerror(errno) << "\n";
-        close(socket_fd);
-        return 1;
-    }
-    std::cout << "Listening on 127.0.0.1:8080\n";
-
-    // accept() blocks until a client connects and returns a new connected fd.
-    int client_fd = accept(socket_fd, nullptr, nullptr);
-    if (client_fd == -1) {
-        std::cerr << "accept failed: " << std::strerror(errno) << "\n";
-        close(socket_fd);
-        return 1;
-    }
-    std::cout << "Client connected\n";
-
+void handle_client(int client_fd) {
     std::string request;
     char buffer[1024];
 
@@ -183,16 +134,69 @@ int main() {
         std::string response = make_http_response("404 Not Found", "Not Found");
         write_all(client_fd, response.data(), response.size());
     }
+}
 
-    // Close the connected socket before the longer-lived listening
-    // socket.
-    if (close(client_fd) == -1) {
-        std::cerr << "close client socket failed: " << std::strerror(errno)
+int main() {
+    // Create an IPv4 TCP endpoint managed by the kernel.
+    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd == -1) {
+        std::cerr << "socket failed: " << std::strerror(errno) << '\n';
+        return 1;
+    }
+
+    int opt = 1;
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) ==
+        -1) {
+        std::cerr << "setsockopt SO_REUSEADDR failed: " << std::strerror(errno)
                   << '\n';
         close(socket_fd);
         return 1;
     }
 
+    // Restrict the first project stage to clients running on this machine.
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(8080);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    int result = bind(socket_fd, reinterpret_cast<const sockaddr*>(&address),
+                      sizeof(address));
+
+    if (result == -1) {
+        std::cerr << "bind failed: " << std::strerror(errno) << '\n';
+        close(socket_fd);
+        return 1;
+    }
+    std::cout << "Bound TCP socket to 127.0.0.1:8080\n";
+
+    // Mark the bound socket as a listening socket for incoming connections.
+    if (listen(socket_fd, 16) == -1) {
+        std::cerr << "listen failed: " << std::strerror(errno) << "\n";
+        close(socket_fd);
+        return 1;
+    }
+    std::cout << "Listening on 127.0.0.1:8080\n";
+
+    // accept() blocks until a client connects and returns a new connected fd.
+    while (true) {
+        int client_fd = accept(socket_fd, nullptr, nullptr);
+        if (client_fd == -1) {
+            std::cerr << "accept failed: " << std::strerror(errno) << "\n";
+            continue;
+        }
+        std::cout << "Client connected: " << client_fd << "\n";
+
+        // handle one client
+        handle_client(client_fd);
+
+        // close client
+        if (close(client_fd) == -1) {
+            std::cerr << "close client socket failed: " << std::strerror(errno)
+                      << "\n";
+        }
+    }
+
+    // Close the connected socket before the longer-lived listening
     if (close(socket_fd) == -1) {
         std::cerr << "close listening socket failed: " << std::strerror(errno)
                   << '\n';
