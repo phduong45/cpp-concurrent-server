@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 
 struct HttpRequest {
@@ -186,14 +187,16 @@ int main() {
         }
         std::cout << "Client connected: " << client_fd << "\n";
 
-        // handle one client
-        handle_client(client_fd);
+        std::thread client_thread([client_fd]() {
+            handle_client(client_fd);
 
-        // close client
-        if (close(client_fd) == -1) {
-            std::cerr << "close client socket failed: " << std::strerror(errno)
-                      << "\n";
-        }
+            if (close(client_fd) == -1) {
+                std::cerr << "close client socket failed: "
+                          << std::strerror(errno) << "\n";
+            }
+        });
+
+        client_thread.detach();
     }
 
     // Close the connected socket before the longer-lived listening
