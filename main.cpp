@@ -1,6 +1,7 @@
 #include "blocking_queue.h"
 #include "net_utils.h"
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
@@ -12,6 +13,12 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
+volatile sig_atomic_t stop_requested = 0;
+
+void handle_signal(int) {
+    stop_requested = 1;
+}
 
 struct HttpRequest {
     std::string method;
@@ -185,6 +192,9 @@ int main() {
     std::vector<std::thread> workers;
     constexpr int workers_count = 4;
 
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
+
     for (int i = 0; i < workers_count; ++i) {
         workers.emplace_back([&connections] {
             while (auto client_fd = connections.wait_and_pop()) {
@@ -197,15 +207,28 @@ int main() {
             }
         });
     }
-    while (true) {
+
+    while (!stop_requested) {
         int client_fd = accept(socket_fd, nullptr, nullptr);
         if (client_fd == -1) {
+            if (errno == EINTR && stop_requested) {
+                break;
+            }
+
             std::cerr << "accept failed: " << std::strerror(errno) << "\n";
             continue;
         }
         std::cout << "Client queued: " << client_fd << "\n";
         if (!connections.push(client_fd)) {
             close(client_fd);
+        }
+    }
+
+    connections.close();
+
+    for (auto& worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
         }
     }
 
