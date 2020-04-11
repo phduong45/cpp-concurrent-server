@@ -6,7 +6,7 @@ TARGETS := server client
 
 all: $(TARGETS)
 
-server: main.cpp net_utils.cpp net_utils.h
+server: main.cpp net_utils.cpp net_utils.h blocking_queue.h
 	$(CXX) $(CXXFLAGS) main.cpp net_utils.cpp -o server
 
 client: client.cpp net_utils.cpp net_utils.h

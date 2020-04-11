@@ -1,3 +1,4 @@
+#include "blocking_queue.h"
 #include "net_utils.h"
 #include <cerrno>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 struct HttpRequest {
     std::string method;
@@ -179,24 +181,32 @@ int main() {
     std::cout << "Listening on 127.0.0.1:8080\n";
 
     // accept() blocks until a client connects and returns a new connected fd.
+    BlockingQueue<int> connections;
+    std::vector<std::thread> workers;
+    constexpr int workers_count = 4;
+
+    for (int i = 0; i < workers_count; ++i) {
+        workers.emplace_back([&connections] {
+            while (auto client_fd = connections.wait_and_pop()) {
+                handle_client(*client_fd);
+
+                if (close(*client_fd) == -1) {
+                    std::cerr << "close client socket failed: "
+                              << std::strerror(errno) << "\n";
+                }
+            }
+        });
+    }
     while (true) {
         int client_fd = accept(socket_fd, nullptr, nullptr);
         if (client_fd == -1) {
             std::cerr << "accept failed: " << std::strerror(errno) << "\n";
             continue;
         }
-        std::cout << "Client connected: " << client_fd << "\n";
-
-        std::thread client_thread([client_fd]() {
-            handle_client(client_fd);
-
-            if (close(client_fd) == -1) {
-                std::cerr << "close client socket failed: "
-                          << std::strerror(errno) << "\n";
-            }
-        });
-
-        client_thread.detach();
+        std::cout << "Client queued: " << client_fd << "\n";
+        if (!connections.push(client_fd)) {
+            close(client_fd);
+        }
     }
 
     // Close the connected socket before the longer-lived listening
