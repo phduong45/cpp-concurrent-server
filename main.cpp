@@ -1,5 +1,6 @@
 #include "blocking_queue.h"
 #include "net_utils.h"
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -19,6 +20,14 @@ volatile sig_atomic_t stop_requested = 0;
 void handle_signal(int) {
     stop_requested = 1;
 }
+
+struct ServerMetrics {
+    std::atomic<std::size_t> total_requests{0};
+    std::atomic<std::size_t> active_connections{0};
+    std::atomic<std::size_t> status_200{0};
+    std::atomic<std::size_t> status_400{0};
+    std::atomic<std::size_t> status_404{0};
+};
 
 struct HttpRequest {
     std::string method;
@@ -79,7 +88,21 @@ std::string make_http_response(std::string_view status, std::string_view body) {
     return response;
 }
 
-void handle_client(int client_fd) {
+std::string make_metrics_body(const ServerMetrics& metrics) {
+    std::string body;
+    body += "total_requests " +
+            std::to_string(metrics.total_requests.load()) + "\n";
+    body += "active_connections " +
+            std::to_string(metrics.active_connections.load()) + "\n";
+    body += "status_200 " + std::to_string(metrics.status_200.load()) + "\n";
+    body += "status_400 " + std::to_string(metrics.status_400.load()) + "\n";
+    body += "status_404 " + std::to_string(metrics.status_404.load()) + "\n";
+    return body;
+}
+
+void handle_client(int client_fd, ServerMetrics& metrics) {
+    metrics.active_connections.fetch_add(1);
+
     std::string request;
     char buffer[1024];
 
@@ -127,23 +150,36 @@ void handle_client(int client_fd) {
     }
 
     auto parsed_request = parse_request_line(request);
+    metrics.total_requests.fetch_add(1);
 
     if (!parsed_request || !body_complete) {
+        metrics.status_400.fetch_add(1);
         std::string response =
             make_http_response("400 Bad Request", "Bad Request");
         write_all(client_fd, response.data(), response.size());
     } else if (parsed_request->method == "GET" &&
                parsed_request->path == "/health") {
+        metrics.status_200.fetch_add(1);
         std::string response = make_http_response("200 OK", "OK");
+        write_all(client_fd, response.data(), response.size());
+    } else if (parsed_request->method == "GET" &&
+               parsed_request->path == "/metrics") {
+        metrics.status_200.fetch_add(1);
+        std::string response =
+            make_http_response("200 OK", make_metrics_body(metrics));
         write_all(client_fd, response.data(), response.size());
     } else if (parsed_request->method == "POST" &&
                parsed_request->path == "/echo") {
+        metrics.status_200.fetch_add(1);
         std::string response = make_http_response("200 OK", body);
         write_all(client_fd, response.data(), response.size());
     } else {
+        metrics.status_404.fetch_add(1);
         std::string response = make_http_response("404 Not Found", "Not Found");
         write_all(client_fd, response.data(), response.size());
     }
+
+    metrics.active_connections.fetch_sub(1);
 }
 
 int main() {
@@ -191,14 +227,15 @@ int main() {
     BlockingQueue<int> connections;
     std::vector<std::thread> workers;
     constexpr int workers_count = 4;
+    ServerMetrics metrics;
 
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
     for (int i = 0; i < workers_count; ++i) {
-        workers.emplace_back([&connections] {
+        workers.emplace_back([&connections, &metrics] {
             while (auto client_fd = connections.wait_and_pop()) {
-                handle_client(*client_fd);
+                handle_client(*client_fd, metrics);
 
                 if (close(*client_fd) == -1) {
                     std::cerr << "close client socket failed: "
