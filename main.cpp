@@ -2,6 +2,7 @@
 #include "net_utils.h"
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <iostream>
@@ -90,8 +91,8 @@ std::string make_http_response(std::string_view status, std::string_view body) {
 
 std::string make_metrics_body(const ServerMetrics& metrics) {
     std::string body;
-    body += "total_requests " +
-            std::to_string(metrics.total_requests.load()) + "\n";
+    body += "total_requests " + std::to_string(metrics.total_requests.load()) +
+            "\n";
     body += "active_connections " +
             std::to_string(metrics.active_connections.load()) + "\n";
     body += "status_200 " + std::to_string(metrics.status_200.load()) + "\n";
@@ -168,6 +169,14 @@ void handle_client(int client_fd, ServerMetrics& metrics) {
         std::string response =
             make_http_response("200 OK", make_metrics_body(metrics));
         write_all(client_fd, response.data(), response.size());
+    } else if (parsed_request->method == "GET" &&
+               parsed_request->path == "/slow") {
+        metrics.status_200.fetch_add(1);
+
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        std::string response = make_http_response("200 OK", "slow OK");
+        write_all(client_fd, response.data(), response.size());
     } else if (parsed_request->method == "POST" &&
                parsed_request->path == "/echo") {
         metrics.status_200.fetch_add(1);
@@ -223,7 +232,8 @@ int main() {
     }
     std::cout << "Listening on 127.0.0.1:8080\n";
 
-    // accept() blocks until a client connects and returns a new connected fd.
+    // accept() blocks until a client connects and returns a new connected
+    // fd.
     BlockingQueue<int> connections;
     std::vector<std::thread> workers;
     constexpr int workers_count = 4;
