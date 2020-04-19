@@ -1,8 +1,6 @@
-#include "blocking_queue.h"
 #include "net_utils.h"
-#include <atomic>
+
 #include <cerrno>
-#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <iostream>
@@ -13,8 +11,8 @@
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
-#include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 volatile sig_atomic_t stop_requested = 0;
@@ -23,18 +21,15 @@ void handle_signal(int) {
     stop_requested = 1;
 }
 
-struct ServerMetrics {
-    std::atomic<std::size_t> total_requests{0};
-    std::atomic<std::size_t> active_connections{0};
-    std::atomic<std::size_t> status_200{0};
-    std::atomic<std::size_t> status_400{0};
-    std::atomic<std::size_t> status_404{0};
-};
-
 struct HttpRequest {
     std::string method;
     std::string path;
     std::string version;
+};
+
+struct Connection {
+    int fd;
+    std::string request;
 };
 
 std::optional<HttpRequest> parse_request_line(std::string_view request) {
@@ -49,30 +44,8 @@ std::optional<HttpRequest> parse_request_line(std::string_view request) {
     if (!(iss >> parsed.method >> parsed.path >> parsed.version)) {
         return std::nullopt;
     }
+
     return parsed;
-}
-
-std::optional<std::size_t> get_content_length(std::string_view headers) {
-    constexpr std::string_view key = "Content-Length:";
-
-    auto pos = headers.find(key);
-    if (pos == std::string_view::npos) {
-        return std::nullopt;
-    }
-
-    auto value_start = pos + key.size();
-    auto line_end = headers.find("\r\n", value_start);
-    if (line_end == std::string_view::npos) {
-        return std::nullopt;
-    }
-
-    std::string value{headers.substr(value_start, line_end - value_start)};
-
-    try {
-        return static_cast<std::size_t>(std::stoul(value));
-    } catch (...) {
-        return std::nullopt;
-    }
 }
 
 std::string make_http_response(std::string_view status, std::string_view body) {
@@ -86,183 +59,147 @@ std::string make_http_response(std::string_view status, std::string_view body) {
     response += "Connection: close\r\n";
     response += "\r\n";
     response += body;
-
     return response;
 }
 
-std::string make_metrics_body(const ServerMetrics& metrics) {
-    std::string body;
-    body += "total_requests " + std::to_string(metrics.total_requests.load()) +
-            "\n";
-    body += "active_connections " +
-            std::to_string(metrics.active_connections.load()) + "\n";
-    body += "status_200 " + std::to_string(metrics.status_200.load()) + "\n";
-    body += "status_400 " + std::to_string(metrics.status_400.load()) + "\n";
-    body += "status_404 " + std::to_string(metrics.status_404.load()) + "\n";
-    return body;
-}
-
-void handle_client(int client_fd, ServerMetrics& metrics) {
-    metrics.active_connections.fetch_add(1);
-
-    std::string request;
-    char buffer[1024];
-
-    while (request.find("\r\n\r\n") == std::string::npos) {
-        ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
-        if (bytes_read == -1) {
-            break;
-        }
-
-        if (bytes_read == 0) {
-            break;
-        }
-
-        request.append(buffer, bytes_read);
-    }
-
-    auto header_end = request.find("\r\n\r\n");
-    std::string body;
-    bool body_complete = header_end != std::string::npos;
-
-    if (body_complete) {
-        std::string_view headers{request.data(), header_end + 4};
-        body = request.substr(header_end + 4);
-
-        if (auto content_length = get_content_length(headers)) {
-            while (body.size() < *content_length) {
-                ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
-                if (bytes_read == -1 || bytes_read == 0) {
-                    body_complete = false;
-                    break;
-                }
-
-                body.append(buffer, bytes_read);
-            }
-
-            if (body.size() > *content_length) {
-                body.resize(*content_length);
-            }
-        }
-    }
-
-    std::cout << "received: " << request << "\n";
-    if (!body.empty()) {
-        std::cout << "body: " << body << "\n";
-    }
-
-    auto parsed_request = parse_request_line(request);
-    metrics.total_requests.fetch_add(1);
-
-    if (!parsed_request || !body_complete) {
-        metrics.status_400.fetch_add(1);
-        std::string response =
-            make_http_response("400 Bad Request", "Bad Request");
-        write_all(client_fd, response.data(), response.size());
-    } else if (parsed_request->method == "GET" &&
-               parsed_request->path == "/health") {
-        metrics.status_200.fetch_add(1);
-        std::string response = make_http_response("200 OK", "OK");
-        write_all(client_fd, response.data(), response.size());
-    } else if (parsed_request->method == "GET" &&
-               parsed_request->path == "/metrics") {
-        metrics.status_200.fetch_add(1);
-        std::string response =
-            make_http_response("200 OK", make_metrics_body(metrics));
-        write_all(client_fd, response.data(), response.size());
-    } else if (parsed_request->method == "GET" &&
-               parsed_request->path == "/slow") {
-        metrics.status_200.fetch_add(1);
-
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-
-        std::string response = make_http_response("200 OK", "slow OK");
-        write_all(client_fd, response.data(), response.size());
-    } else if (parsed_request->method == "POST" &&
-               parsed_request->path == "/echo") {
-        metrics.status_200.fetch_add(1);
-        std::string response = make_http_response("200 OK", body);
-        write_all(client_fd, response.data(), response.size());
-    } else {
-        metrics.status_404.fetch_add(1);
-        std::string response = make_http_response("404 Not Found", "Not Found");
-        write_all(client_fd, response.data(), response.size());
-    }
-
-    metrics.active_connections.fetch_sub(1);
-}
-
-int main() {
-    // Create an IPv4 TCP endpoint managed by the kernel.
-    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_fd == -1) {
-        std::cerr << "socket failed: " << std::strerror(errno) << '\n';
-        return 1;
-    }
-
+bool bind_and_listen(int socket_fd, int port) {
     int opt = 1;
     if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) ==
         -1) {
         std::cerr << "setsockopt SO_REUSEADDR failed: " << std::strerror(errno)
-                  << '\n';
-        close(socket_fd);
-        return 1;
+                  << "\n";
+        return false;
     }
 
-    // Restrict the first project stage to clients running on this machine.
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_port = htons(8080);
+    address.sin_port = htons(port);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    int result = bind(socket_fd, reinterpret_cast<const sockaddr*>(&address),
-                      sizeof(address));
-
-    if (result == -1) {
-        std::cerr << "bind failed: " << std::strerror(errno) << '\n';
-        close(socket_fd);
-        return 1;
+    if (bind(socket_fd, reinterpret_cast<const sockaddr*>(&address),
+             sizeof(address)) == -1) {
+        std::cerr << "bind failed: " << std::strerror(errno) << "\n";
+        return false;
     }
-    std::cout << "Bound TCP socket to 127.0.0.1:8080\n";
 
-    // Mark the bound socket as a listening socket for incoming connections.
     if (listen(socket_fd, 16) == -1) {
         std::cerr << "listen failed: " << std::strerror(errno) << "\n";
-        close(socket_fd);
-        return 1;
+        return false;
     }
-    std::cout << "Listening on 127.0.0.1:8080\n";
 
-    // accept() blocks until a client connects and returns a new connected
-    // fd.
-    BlockingQueue<int> connections;
-    std::vector<std::thread> workers;
-    constexpr int workers_count = 4;
-    ServerMetrics metrics;
+    return true;
+}
 
+void accept_ready_clients(int socket_fd,
+                          std::unordered_map<int, Connection>& connections) {
+    while (true) {
+        int client_fd = accept(socket_fd, nullptr, nullptr);
+        if (client_fd == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+
+            if (errno == EINTR) {
+                continue;
+            }
+
+            std::cerr << "accept failed: " << std::strerror(errno) << "\n";
+            break;
+        }
+
+        if (!set_nonblocking(client_fd)) {
+            std::cerr << "set client nonblocking failed: "
+                      << std::strerror(errno) << "\n";
+            close(client_fd);
+            continue;
+        }
+
+        std::cout << "Client accepted: " << client_fd << "\n";
+        connections.emplace(client_fd, Connection{client_fd, ""});
+    }
+}
+
+bool read_available_data(Connection& connection) {
+    char buffer[1024];
+
+    while (true) {
+        ssize_t bytes_read = read(connection.fd, buffer, sizeof(buffer));
+
+        if (bytes_read > 0) {
+            connection.request.append(buffer, bytes_read);
+            continue;
+        }
+
+        if (bytes_read == 0) {
+            return false;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return true;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        return false;
+    }
+}
+
+bool request_header_complete(const Connection& connection) {
+    return connection.request.find("\r\n\r\n") != std::string::npos;
+}
+
+std::string route_request(std::string_view request) {
+    auto parsed = parse_request_line(request);
+    if (parsed && parsed->method == "GET" && parsed->path == "/health") {
+        return make_http_response("200 OK", "OK");
+    }
+
+    return make_http_response("404 Not Found", "Not Found");
+}
+
+int main() {
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
-    for (int i = 0; i < workers_count; ++i) {
-        workers.emplace_back([&connections, &metrics] {
-            while (auto client_fd = connections.wait_and_pop()) {
-                handle_client(*client_fd, metrics);
-
-                if (close(*client_fd) == -1) {
-                    std::cerr << "close client socket failed: "
-                              << std::strerror(errno) << "\n";
-                }
-            }
-        });
+    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd == -1) {
+        std::cerr << "socket failed: " << std::strerror(errno) << "\n";
+        return 1;
     }
 
-    pollfd listen_event{};
-    listen_event.fd = socket_fd;
-    listen_event.events = POLLIN;
+    if (!bind_and_listen(socket_fd, 8080)) {
+        close(socket_fd);
+        return 1;
+    }
+
+    if (!set_nonblocking(socket_fd)) {
+        std::cerr << "set listening socket nonblocking failed: "
+                  << std::strerror(errno) << "\n";
+        close(socket_fd);
+        return 1;
+    }
+
+    std::cout << "Event-loop server listening on 127.0.0.1:8080\n";
+    std::unordered_map<int, Connection> connections;
 
     while (!stop_requested) {
-        listen_event.revents = 0;
-        int ready = poll(&listen_event, 1, 1000);
+        std::vector<pollfd> poll_fds;
+
+        pollfd listening{};
+        listening.fd = socket_fd;
+        listening.events = POLLIN;
+        poll_fds.push_back(listening);
+
+        for (const auto& [fd, connection] : connections) {
+            pollfd client{};
+            client.fd = fd;
+            client.events = POLLIN;
+            poll_fds.push_back(client);
+        }
+
+        int ready = poll(poll_fds.data(), poll_fds.size(), 1000);
         if (ready == -1) {
             if (errno == EINTR) {
                 continue;
@@ -276,39 +213,52 @@ int main() {
             continue;
         }
 
-        if (!(listen_event.revents & POLLIN)) {
-            continue;
+        if (poll_fds[0].revents & POLLIN) {
+            accept_ready_clients(socket_fd, connections);
         }
 
-        int client_fd = accept(socket_fd, nullptr, nullptr);
-        if (client_fd == -1) {
-            if (errno == EINTR && stop_requested) {
-                break;
+        std::vector<int> to_close;
+
+        for (std::size_t i = 1; i < poll_fds.size(); ++i) {
+            int fd = poll_fds[i].fd;
+
+            if (poll_fds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                to_close.push_back(fd);
+                continue;
             }
 
-            std::cerr << "accept failed: " << std::strerror(errno) << "\n";
-            continue;
+            if (!(poll_fds[i].revents & POLLIN)) {
+                continue;
+            }
+
+            auto it = connections.find(fd);
+            if (it == connections.end()) {
+                continue;
+            }
+
+            Connection& connection = it->second;
+            if (!read_available_data(connection)) {
+                to_close.push_back(fd);
+                continue;
+            }
+
+            if (request_header_complete(connection)) {
+                std::string response = route_request(connection.request);
+                write_all(fd, response.data(), response.size());
+                to_close.push_back(fd);
+            }
         }
-        std::cout << "Client queued: " << client_fd << "\n";
-        if (!connections.push(client_fd)) {
-            close(client_fd);
+
+        for (int fd : to_close) {
+            close(fd);
+            connections.erase(fd);
         }
     }
 
-    connections.close();
-
-    for (auto& worker : workers) {
-        if (worker.joinable()) {
-            worker.join();
-        }
+    for (auto& [fd, connection] : connections) {
+        close(fd);
     }
 
-    // Close the connected socket before the longer-lived listening
-    if (close(socket_fd) == -1) {
-        std::cerr << "close listening socket failed: " << std::strerror(errno)
-                  << '\n';
-        return 1;
-    }
-
+    close(socket_fd);
     return 0;
 }

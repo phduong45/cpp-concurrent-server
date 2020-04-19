@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdint>
+#include <fcntl.h>
 #include <unistd.h>
 
 bool write_all(int fd, const char* data, std::size_t size) {
