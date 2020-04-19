@@ -8,6 +8,7 @@
 #include <iostream>
 #include <netinet/in.h>
 #include <optional>
+#include <poll.h>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -255,7 +256,30 @@ int main() {
         });
     }
 
+    pollfd listen_event{};
+    listen_event.fd = socket_fd;
+    listen_event.events = POLLIN;
+
     while (!stop_requested) {
+        listen_event.revents = 0;
+        int ready = poll(&listen_event, 1, 1000);
+        if (ready == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            std::cerr << "poll failed: " << std::strerror(errno) << "\n";
+            continue;
+        }
+
+        if (ready == 0) {
+            continue;
+        }
+
+        if (!(listen_event.revents & POLLIN)) {
+            continue;
+        }
+
         int client_fd = accept(socket_fd, nullptr, nullptr);
         if (client_fd == -1) {
             if (errno == EINTR && stop_requested) {
