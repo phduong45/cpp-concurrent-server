@@ -30,6 +30,8 @@ struct HttpRequest {
 struct Connection {
     int fd;
     std::string request;
+    std::string response;
+    std::size_t bytes_sent = 0;
 };
 
 std::optional<HttpRequest> parse_request_line(std::string_view request) {
@@ -115,7 +117,9 @@ void accept_ready_clients(int socket_fd,
         }
 
         std::cout << "Client accepted: " << client_fd << "\n";
-        connections.emplace(client_fd, Connection{client_fd, ""});
+        Connection connection{};
+        connection.fd = client_fd;
+        connections.emplace(client_fd, std::move(connection));
     }
 }
 
@@ -148,6 +152,41 @@ bool read_available_data(Connection& connection) {
 
 bool request_header_complete(const Connection& connection) {
     return connection.request.find("\r\n\r\n") != std::string::npos;
+}
+
+bool has_pending_response(const Connection& connection) {
+    return connection.bytes_sent < connection.response.size();
+}
+
+bool write_pending_data(Connection& connection) {
+    while (connection.bytes_sent < connection.response.size()) {
+        const char* data = connection.response.data() + connection.bytes_sent;
+        std::size_t remaining =
+            connection.response.size() - connection.bytes_sent;
+
+        ssize_t bytes_written = write(connection.fd, data, remaining);
+
+        if (bytes_written > 0) {
+            connection.bytes_sent += bytes_written;
+            continue;
+        }
+
+        if (bytes_written == 0) {
+            return false;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return true;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        return false;
+    }
+
+    return true;
 }
 
 std::string route_request(std::string_view request) {
@@ -195,7 +234,7 @@ int main() {
         for (const auto& [fd, connection] : connections) {
             pollfd client{};
             client.fd = fd;
-            client.events = POLLIN;
+            client.events = has_pending_response(connection) ? POLLOUT : POLLIN;
             poll_fds.push_back(client);
         }
 
@@ -227,25 +266,34 @@ int main() {
                 continue;
             }
 
-            if (!(poll_fds[i].revents & POLLIN)) {
-                continue;
-            }
-
             auto it = connections.find(fd);
             if (it == connections.end()) {
                 continue;
             }
 
             Connection& connection = it->second;
-            if (!read_available_data(connection)) {
-                to_close.push_back(fd);
-                continue;
+
+            if (poll_fds[i].revents & POLLIN) {
+                if (!read_available_data(connection)) {
+                    to_close.push_back(fd);
+                    continue;
+                }
+
+                if (request_header_complete(connection)) {
+                    connection.response = route_request(connection.request);
+                    connection.bytes_sent = 0;
+                }
             }
 
-            if (request_header_complete(connection)) {
-                std::string response = route_request(connection.request);
-                write_all(fd, response.data(), response.size());
-                to_close.push_back(fd);
+            if (poll_fds[i].revents & POLLOUT) {
+                if (!write_pending_data(connection)) {
+                    to_close.push_back(fd);
+                    continue;
+                }
+
+                if (!has_pending_response(connection)) {
+                    to_close.push_back(fd);
+                }
             }
         }
 
