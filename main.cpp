@@ -58,6 +58,29 @@ std::optional<HttpRequest> parse_request_line(std::string_view request) {
     return parsed;
 }
 
+std::optional<std::size_t> get_content_length(std::string_view headers) {
+    constexpr std::string_view key = "Content-Length:";
+
+    auto pos = headers.find(key);
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    auto value_start = pos + key.size();
+    auto line_end = headers.find("\r\n", value_start);
+    if (line_end == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    std::string value{headers.substr(value_start, line_end - value_start)};
+
+    try {
+        return static_cast<std::size_t>(std::stoul(value));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 std::string make_http_response(std::string_view status, std::string_view body) {
     std::string response;
     response += "HTTP/1.1 ";
@@ -171,8 +194,31 @@ bool read_available_data(Connection& connection) {
     }
 }
 
-bool request_header_complete(const Connection& connection) {
-    return connection.request.find("\r\n\r\n") != std::string::npos;
+bool request_complete(std::string_view request) {
+    auto header_end = request.find("\r\n\r\n");
+    if (header_end == std::string_view::npos) {
+        return false;
+    }
+
+    std::string_view headers{request.data(), header_end + 4};
+    auto content_length = get_content_length(headers);
+    if (!content_length) {
+        return true;
+    }
+
+    std::size_t body_start = header_end + 4;
+    std::size_t body_size = request.size() - body_start;
+    return body_size >= *content_length;
+}
+
+std::string_view request_body(std::string_view request) {
+    auto header_end = request.find("\r\n\r\n");
+    if (header_end == std::string_view::npos) {
+        return {};
+    }
+
+    std::size_t body_start = header_end + 4;
+    return request.substr(body_start);
 }
 
 bool has_pending_response(const Connection& connection) {
@@ -222,6 +268,11 @@ std::string route_request(std::string_view request, ServerMetrics& metrics) {
     if (parsed && parsed->method == "GET" && parsed->path == "/metrics") {
         metrics.status_200.fetch_add(1);
         return make_http_response("200 OK", make_metrics_body(metrics));
+    }
+
+    if (parsed && parsed->method == "POST" && parsed->path == "/echo") {
+        metrics.status_200.fetch_add(1);
+        return make_http_response("200 OK", request_body(request));
     }
 
     metrics.status_404.fetch_add(1);
@@ -310,7 +361,7 @@ int main() {
                     continue;
                 }
 
-                if (request_header_complete(connection)) {
+                if (request_complete(connection.request)) {
                     connection.response =
                         route_request(connection.request, metrics);
                     connection.bytes_sent = 0;
