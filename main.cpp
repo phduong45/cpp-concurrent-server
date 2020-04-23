@@ -1,5 +1,6 @@
 #include "net_utils.h"
 
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -20,6 +21,13 @@ volatile sig_atomic_t stop_requested = 0;
 void handle_signal(int) {
     stop_requested = 1;
 }
+
+struct ServerMetrics {
+    std::atomic<std::size_t> total_requests{0};
+    std::atomic<std::size_t> active_connections{0};
+    std::atomic<std::size_t> status_200{0};
+    std::atomic<std::size_t> status_404{0};
+};
 
 struct HttpRequest {
     std::string method;
@@ -64,6 +72,17 @@ std::string make_http_response(std::string_view status, std::string_view body) {
     return response;
 }
 
+std::string make_metrics_body(const ServerMetrics& metrics) {
+    std::string body;
+    body += "total_requests " + std::to_string(metrics.total_requests.load()) +
+            "\n";
+    body += "active_connections " +
+            std::to_string(metrics.active_connections.load()) + "\n";
+    body += "status_200 " + std::to_string(metrics.status_200.load()) + "\n";
+    body += "status_404 " + std::to_string(metrics.status_404.load()) + "\n";
+    return body;
+}
+
 bool bind_and_listen(int socket_fd, int port) {
     int opt = 1;
     if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) ==
@@ -93,7 +112,8 @@ bool bind_and_listen(int socket_fd, int port) {
 }
 
 void accept_ready_clients(int socket_fd,
-                          std::unordered_map<int, Connection>& connections) {
+                          std::unordered_map<int, Connection>& connections,
+                          ServerMetrics& metrics) {
     while (true) {
         int client_fd = accept(socket_fd, nullptr, nullptr);
         if (client_fd == -1) {
@@ -120,6 +140,7 @@ void accept_ready_clients(int socket_fd,
         Connection connection{};
         connection.fd = client_fd;
         connections.emplace(client_fd, std::move(connection));
+        metrics.active_connections.fetch_add(1);
     }
 }
 
@@ -189,12 +210,21 @@ bool write_pending_data(Connection& connection) {
     return true;
 }
 
-std::string route_request(std::string_view request) {
+std::string route_request(std::string_view request, ServerMetrics& metrics) {
+    metrics.total_requests.fetch_add(1);
+
     auto parsed = parse_request_line(request);
     if (parsed && parsed->method == "GET" && parsed->path == "/health") {
+        metrics.status_200.fetch_add(1);
         return make_http_response("200 OK", "OK");
     }
 
+    if (parsed && parsed->method == "GET" && parsed->path == "/metrics") {
+        metrics.status_200.fetch_add(1);
+        return make_http_response("200 OK", make_metrics_body(metrics));
+    }
+
+    metrics.status_404.fetch_add(1);
     return make_http_response("404 Not Found", "Not Found");
 }
 
@@ -222,6 +252,7 @@ int main() {
 
     std::cout << "Event-loop server listening on 127.0.0.1:8080\n";
     std::unordered_map<int, Connection> connections;
+    ServerMetrics metrics;
 
     while (!stop_requested) {
         std::vector<pollfd> poll_fds;
@@ -253,7 +284,7 @@ int main() {
         }
 
         if (poll_fds[0].revents & POLLIN) {
-            accept_ready_clients(socket_fd, connections);
+            accept_ready_clients(socket_fd, connections, metrics);
         }
 
         std::vector<int> to_close;
@@ -280,7 +311,8 @@ int main() {
                 }
 
                 if (request_header_complete(connection)) {
-                    connection.response = route_request(connection.request);
+                    connection.response =
+                        route_request(connection.request, metrics);
                     connection.bytes_sent = 0;
                 }
             }
@@ -298,8 +330,10 @@ int main() {
         }
 
         for (int fd : to_close) {
+            if (connections.erase(fd) > 0) {
+                metrics.active_connections.fetch_sub(1);
+            }
             close(fd);
-            connections.erase(fd);
         }
     }
 
