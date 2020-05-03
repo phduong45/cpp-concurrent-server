@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <iostream>
@@ -40,6 +41,7 @@ struct Connection {
     std::string request;
     std::string response;
     std::size_t bytes_sent = 0;
+    std::optional<std::chrono::steady_clock::time_point> ready_at;
 };
 
 std::optional<HttpRequest> parse_request_line(std::string_view request) {
@@ -225,6 +227,10 @@ bool has_pending_response(const Connection& connection) {
     return connection.bytes_sent < connection.response.size();
 }
 
+bool waiting_for_timer(const Connection& connection) {
+    return connection.ready_at.has_value() && connection.response.empty();
+}
+
 bool write_pending_data(Connection& connection) {
     while (connection.bytes_sent < connection.response.size()) {
         const char* data = connection.response.data() + connection.bytes_sent;
@@ -256,10 +262,10 @@ bool write_pending_data(Connection& connection) {
     return true;
 }
 
-std::string route_request(std::string_view request, ServerMetrics& metrics) {
+std::string route_request(Connection& connection, ServerMetrics& metrics) {
     metrics.total_requests.fetch_add(1);
 
-    auto parsed = parse_request_line(request);
+    auto parsed = parse_request_line(connection.request);
     if (parsed && parsed->method == "GET" && parsed->path == "/health") {
         metrics.status_200.fetch_add(1);
         return make_http_response("200 OK", "OK");
@@ -270,9 +276,16 @@ std::string route_request(std::string_view request, ServerMetrics& metrics) {
         return make_http_response("200 OK", make_metrics_body(metrics));
     }
 
+    if (parsed && parsed->method == "GET" && parsed->path == "/slow") {
+        metrics.status_200.fetch_add(1);
+        connection.ready_at =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        return {};
+    }
+
     if (parsed && parsed->method == "POST" && parsed->path == "/echo") {
         metrics.status_200.fetch_add(1);
-        return make_http_response("200 OK", request_body(request));
+        return make_http_response("200 OK", request_body(connection.request));
     }
 
     metrics.status_404.fetch_add(1);
@@ -306,6 +319,15 @@ int main() {
     ServerMetrics metrics;
 
     while (!stop_requested) {
+        auto now = std::chrono::steady_clock::now();
+        for (auto& [fd, connection] : connections) {
+            if (connection.ready_at && now >= *connection.ready_at) {
+                connection.response = make_http_response("200 OK", "slow OK");
+                connection.bytes_sent = 0;
+                connection.ready_at.reset();
+            }
+        }
+
         std::vector<pollfd> poll_fds;
 
         pollfd listening{};
@@ -316,11 +338,17 @@ int main() {
         for (const auto& [fd, connection] : connections) {
             pollfd client{};
             client.fd = fd;
-            client.events = has_pending_response(connection) ? POLLOUT : POLLIN;
+            if (has_pending_response(connection)) {
+                client.events = POLLOUT;
+            } else if (waiting_for_timer(connection)) {
+                client.events = 0;
+            } else {
+                client.events = POLLIN;
+            }
             poll_fds.push_back(client);
         }
 
-        int ready = poll(poll_fds.data(), poll_fds.size(), 1000);
+        int ready = poll(poll_fds.data(), poll_fds.size(), 100);
         if (ready == -1) {
             if (errno == EINTR) {
                 continue;
@@ -362,9 +390,10 @@ int main() {
                 }
 
                 if (request_complete(connection.request)) {
-                    connection.response =
-                        route_request(connection.request, metrics);
-                    connection.bytes_sent = 0;
+                    connection.response = route_request(connection, metrics);
+                    if (!connection.response.empty()) {
+                        connection.bytes_sent = 0;
+                    }
                 }
             }
 
