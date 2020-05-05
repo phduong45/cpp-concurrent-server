@@ -6,8 +6,8 @@ TARGETS := server client
 
 all: $(TARGETS)
 
-server: main.cpp net_utils.cpp net_utils.h
-	$(CXX) $(CXXFLAGS) main.cpp net_utils.cpp -o server
+server: main.cpp http.cpp http.h net_utils.cpp net_utils.h
+	$(CXX) $(CXXFLAGS) main.cpp http.cpp net_utils.cpp -o server
 
 client: client.cpp net_utils.cpp net_utils.h
 	$(CXX) $(CXXFLAGS) client.cpp net_utils.cpp -o client
