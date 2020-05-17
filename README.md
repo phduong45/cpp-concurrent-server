@@ -1,19 +1,19 @@
 # C++ Concurrent Server
 
-A TCP server built incrementally while studying Linux networking and C++
-concurrency.
+A small C++ HTTP server used to study sockets, non-blocking I/O, and event-loop
+server design.
 
-## Current Progress
+Current version:
 
-- Create an IPv4 TCP socket.
-- Bind to `127.0.0.1:8080`.
-- Listen for incoming connections.
-- Accept one TCP client.
+- `poll()`-based event loop
+- non-blocking client sockets
+- per-connection request/response buffers
+- routes: `/health`, `/metrics`, `/echo`, `/slow`
 
 ## Build
 
 ```bash
-make
+make clean && make
 ```
 
 ## Run
@@ -22,17 +22,19 @@ make
 ./server
 ```
 
-Connect from another terminal:
+## Try It
 
 ```bash
-nc 127.0.0.1 8080
+curl http://127.0.0.1:8080/health
+curl -X POST http://127.0.0.1:8080/echo -d 'hello'
+curl http://127.0.0.1:8080/metrics
 ```
 
-## Roadmap
+`/slow` uses timer state instead of blocking the event loop:
 
-- Echo client data.
-- Handle partial reads and writes.
-- Support concurrent clients.
-- Add a bounded thread pool.
-- Add graceful shutdown.
-- Move to event-driven I/O.
+```bash
+time sh -c 'for i in $(seq 1 8); do curl -s http://127.0.0.1:8080/slow >/dev/null & done; wait'
+```
+
+Limitations: minimal HTTP parsing, no keep-alive, no TLS, and `poll()` instead
+of Linux `epoll`.
