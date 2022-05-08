@@ -30,6 +30,12 @@ curl -X POST http://127.0.0.1:8080/echo -d 'hello'
 curl http://127.0.0.1:8080/metrics
 ```
 
+Smoke test, with `./server` already running:
+
+```bash
+./scripts/smoke_test.sh
+```
+
 `/slow` uses timer state instead of blocking the event loop:
 
 ```bash
