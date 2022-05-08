@@ -9,8 +9,8 @@
 #include <iostream>
 #include <netinet/in.h>
 #include <optional>
-#include <poll.h>
 #include <string>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -76,7 +76,31 @@ bool bind_and_listen(int socket_fd, int port) {
     return true;
 }
 
-void accept_ready_clients(int socket_fd,
+bool update_epoll_interest(int epoll_fd, const Connection& connection) {
+    epoll_event event{};
+    event.data.fd = connection.fd;
+    event.events = EPOLLERR | EPOLLHUP;
+
+    if (connection.bytes_sent < connection.response.size()) {
+        event.events |= EPOLLOUT;
+    } else if (!(connection.ready_at && connection.response.empty())) {
+        event.events |= EPOLLIN;
+    }
+
+    return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection.fd, &event) != -1;
+}
+
+void close_connection(int fd, int epoll_fd,
+                      std::unordered_map<int, Connection>& connections,
+                      ServerMetrics& metrics) {
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    if (connections.erase(fd) > 0) {
+        metrics.active_connections.fetch_sub(1);
+    }
+    close(fd);
+}
+
+void accept_ready_clients(int socket_fd, int epoll_fd,
                           std::unordered_map<int, Connection>& connections,
                           ServerMetrics& metrics) {
     while (true) {
@@ -101,11 +125,22 @@ void accept_ready_clients(int socket_fd,
             continue;
         }
 
-        std::cout << "Client accepted: " << client_fd << "\n";
         Connection connection{};
         connection.fd = client_fd;
         connections.emplace(client_fd, std::move(connection));
         metrics.active_connections.fetch_add(1);
+
+        epoll_event event{};
+        event.data.fd = client_fd;
+        event.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) == -1) {
+            std::cerr << "epoll add client failed: " << std::strerror(errno)
+                      << "\n";
+            close_connection(client_fd, epoll_fd, connections, metrics);
+            continue;
+        }
+
+        std::cout << "Client accepted: " << client_fd << "\n";
     }
 }
 
@@ -134,14 +169,6 @@ bool read_available_data(Connection& connection) {
 
         return false;
     }
-}
-
-bool has_pending_response(const Connection& connection) {
-    return connection.bytes_sent < connection.response.size();
-}
-
-bool waiting_for_timer(const Connection& connection) {
-    return connection.ready_at.has_value() && connection.response.empty();
 }
 
 bool write_pending_data(Connection& connection) {
@@ -227,9 +254,29 @@ int main() {
         return 1;
     }
 
-    std::cout << "Event-loop server listening on 127.0.0.1:8080\n";
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd == -1) {
+        std::cerr << "epoll_create1 failed: " << std::strerror(errno) << "\n";
+        close(socket_fd);
+        return 1;
+    }
+
+    epoll_event listen_event{};
+    listen_event.data.fd = socket_fd;
+    listen_event.events = EPOLLIN;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &listen_event) == -1) {
+        std::cerr << "epoll add listen socket failed: " << std::strerror(errno)
+                  << "\n";
+        close(epoll_fd);
+        close(socket_fd);
+        return 1;
+    }
+
+    std::cout << "server listening on 127.0.0.1:8080 (epoll)\n";
+
     std::unordered_map<int, Connection> connections;
     ServerMetrics metrics;
+    std::vector<epoll_event> events(64);
 
     while (!stop_requested) {
         auto now = std::chrono::steady_clock::now();
@@ -238,54 +285,35 @@ int main() {
                 connection.response = make_http_response("200 OK", "slow OK");
                 connection.bytes_sent = 0;
                 connection.ready_at.reset();
+                if (!update_epoll_interest(epoll_fd, connection)) {
+                    std::cerr << "epoll update failed: " << std::strerror(errno)
+                              << "\n";
+                }
             }
         }
 
-        std::vector<pollfd> poll_fds;
-
-        pollfd listening{};
-        listening.fd = socket_fd;
-        listening.events = POLLIN;
-        poll_fds.push_back(listening);
-
-        for (const auto& [fd, connection] : connections) {
-            pollfd client{};
-            client.fd = fd;
-            if (has_pending_response(connection)) {
-                client.events = POLLOUT;
-            } else if (waiting_for_timer(connection)) {
-                client.events = 0;
-            } else {
-                client.events = POLLIN;
-            }
-            poll_fds.push_back(client);
-        }
-
-        int ready = poll(poll_fds.data(), poll_fds.size(), 100);
+        int ready =
+            epoll_wait(epoll_fd, events.data(), events.size(), 100);
         if (ready == -1) {
             if (errno == EINTR) {
                 continue;
             }
 
-            std::cerr << "poll failed: " << std::strerror(errno) << "\n";
+            std::cerr << "epoll_wait failed: " << std::strerror(errno) << "\n";
             continue;
-        }
-
-        if (ready == 0) {
-            continue;
-        }
-
-        if (poll_fds[0].revents & POLLIN) {
-            accept_ready_clients(socket_fd, connections, metrics);
         }
 
         std::vector<int> to_close;
 
-        for (std::size_t i = 1; i < poll_fds.size(); ++i) {
-            int fd = poll_fds[i].fd;
+        for (int i = 0; i < ready; ++i) {
+            int fd = events[i].data.fd;
+            uint32_t event_flags = events[i].events;
 
-            if (poll_fds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-                to_close.push_back(fd);
+            if (fd == socket_fd) {
+                if (event_flags & EPOLLIN) {
+                    accept_ready_clients(socket_fd, epoll_fd, connections,
+                                         metrics);
+                }
                 continue;
             }
 
@@ -296,7 +324,12 @@ int main() {
 
             Connection& connection = it->second;
 
-            if (poll_fds[i].revents & POLLIN) {
+            if (event_flags & (EPOLLERR | EPOLLHUP)) {
+                to_close.push_back(fd);
+                continue;
+            }
+
+            if (event_flags & EPOLLIN) {
                 if (!read_available_data(connection)) {
                     to_close.push_back(fd);
                     continue;
@@ -304,29 +337,29 @@ int main() {
 
                 if (request_complete(connection.request)) {
                     connection.response = route_request(connection, metrics);
-                    if (!connection.response.empty()) {
-                        connection.bytes_sent = 0;
-                    }
+                    connection.bytes_sent = 0;
                 }
             }
 
-            if (poll_fds[i].revents & POLLOUT) {
+            if (event_flags & EPOLLOUT) {
                 if (!write_pending_data(connection)) {
                     to_close.push_back(fd);
                     continue;
                 }
 
-                if (!has_pending_response(connection)) {
+                if (connection.bytes_sent >= connection.response.size()) {
                     to_close.push_back(fd);
+                    continue;
                 }
+            }
+
+            if (!update_epoll_interest(epoll_fd, connection)) {
+                to_close.push_back(fd);
             }
         }
 
         for (int fd : to_close) {
-            if (connections.erase(fd) > 0) {
-                metrics.active_connections.fetch_sub(1);
-            }
-            close(fd);
+            close_connection(fd, epoll_fd, connections, metrics);
         }
     }
 
@@ -334,6 +367,7 @@ int main() {
         close(fd);
     }
 
+    close(epoll_fd);
     close(socket_fd);
     return 0;
 }

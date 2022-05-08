@@ -5,7 +5,7 @@ server design.
 
 Current version:
 
-- `poll()`-based event loop
+- Linux `epoll`-based event loop
 - non-blocking client sockets
 - per-connection request/response buffers
 - routes: `/health`, `/metrics`, `/echo`, `/slow`
@@ -36,5 +36,4 @@ curl http://127.0.0.1:8080/metrics
 time sh -c 'for i in $(seq 1 8); do curl -s http://127.0.0.1:8080/slow >/dev/null & done; wait'
 ```
 
-Limitations: minimal HTTP parsing, no keep-alive, no TLS, and `poll()` instead
-of Linux `epoll`.
+Limitations: minimal HTTP parsing, no keep-alive, no TLS, and Linux `epoll`.
