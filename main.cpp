@@ -4,11 +4,12 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <csignal>
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
-#include <optional>
+#include <queue>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -34,7 +35,20 @@ struct Connection {
     std::string request;
     std::string response;
     std::size_t bytes_sent = 0;
-    std::optional<std::chrono::steady_clock::time_point> ready_at;
+    bool waiting_for_timer = false;
+    std::uint64_t timer_id = 0;
+};
+
+struct Timer {
+    std::chrono::steady_clock::time_point ready_at;
+    int fd;
+    std::uint64_t id;
+};
+
+struct TimerLater {
+    bool operator()(const Timer& left, const Timer& right) const {
+        return left.ready_at > right.ready_at;
+    }
 };
 
 std::string make_metrics_body(const ServerMetrics& metrics) {
@@ -83,7 +97,7 @@ bool update_epoll_interest(int epoll_fd, const Connection& connection) {
 
     if (connection.bytes_sent < connection.response.size()) {
         event.events |= EPOLLOUT;
-    } else if (!(connection.ready_at && connection.response.empty())) {
+    } else if (!connection.waiting_for_timer) {
         event.events |= EPOLLIN;
     }
 
@@ -202,7 +216,10 @@ bool write_pending_data(Connection& connection) {
     return true;
 }
 
-std::string route_request(Connection& connection, ServerMetrics& metrics) {
+using TimerQueue = std::priority_queue<Timer, std::vector<Timer>, TimerLater>;
+
+std::string route_request(Connection& connection, ServerMetrics& metrics,
+                          TimerQueue& timers, std::uint64_t& next_timer_id) {
     metrics.total_requests.fetch_add(1);
 
     auto parsed = parse_request_line(connection.request);
@@ -218,8 +235,11 @@ std::string route_request(Connection& connection, ServerMetrics& metrics) {
 
     if (parsed && parsed->method == "GET" && parsed->path == "/slow") {
         metrics.status_200.fetch_add(1);
-        connection.ready_at =
-            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        connection.waiting_for_timer = true;
+        connection.timer_id = next_timer_id++;
+        timers.push(Timer{std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2),
+                          connection.fd, connection.timer_id});
         return {};
     }
 
@@ -230,6 +250,51 @@ std::string route_request(Connection& connection, ServerMetrics& metrics) {
 
     metrics.status_404.fetch_add(1);
     return make_http_response("404 Not Found", "Not Found");
+}
+
+void process_expired_timers(int epoll_fd,
+                            std::unordered_map<int, Connection>& connections,
+                            TimerQueue& timers) {
+    auto now = std::chrono::steady_clock::now();
+
+    while (!timers.empty() && timers.top().ready_at <= now) {
+        Timer timer = timers.top();
+        timers.pop();
+
+        auto it = connections.find(timer.fd);
+        if (it == connections.end()) {
+            continue;
+        }
+
+        Connection& connection = it->second;
+        if (!connection.waiting_for_timer || connection.timer_id != timer.id) {
+            continue;
+        }
+
+        connection.response = make_http_response("200 OK", "slow OK");
+        connection.bytes_sent = 0;
+        connection.waiting_for_timer = false;
+
+        if (!update_epoll_interest(epoll_fd, connection)) {
+            std::cerr << "epoll update failed: " << std::strerror(errno)
+                      << "\n";
+        }
+    }
+}
+
+int next_epoll_timeout(const TimerQueue& timers) {
+    if (timers.empty()) {
+        return -1;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (timers.top().ready_at <= now) {
+        return 0;
+    }
+
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        timers.top().ready_at - now);
+    return static_cast<int>(remaining.count());
 }
 
 int main() {
@@ -277,23 +342,14 @@ int main() {
     std::unordered_map<int, Connection> connections;
     ServerMetrics metrics;
     std::vector<epoll_event> events(64);
+    TimerQueue timers;
+    std::uint64_t next_timer_id = 1;
 
     while (!stop_requested) {
-        auto now = std::chrono::steady_clock::now();
-        for (auto& [fd, connection] : connections) {
-            if (connection.ready_at && now >= *connection.ready_at) {
-                connection.response = make_http_response("200 OK", "slow OK");
-                connection.bytes_sent = 0;
-                connection.ready_at.reset();
-                if (!update_epoll_interest(epoll_fd, connection)) {
-                    std::cerr << "epoll update failed: " << std::strerror(errno)
-                              << "\n";
-                }
-            }
-        }
+        process_expired_timers(epoll_fd, connections, timers);
 
-        int ready =
-            epoll_wait(epoll_fd, events.data(), events.size(), 100);
+        int ready = epoll_wait(epoll_fd, events.data(), events.size(),
+                               next_epoll_timeout(timers));
         if (ready == -1) {
             if (errno == EINTR) {
                 continue;
@@ -336,7 +392,9 @@ int main() {
                 }
 
                 if (request_complete(connection.request)) {
-                    connection.response = route_request(connection, metrics);
+                    connection.response =
+                        route_request(connection, metrics, timers,
+                                      next_timer_id);
                     connection.bytes_sent = 0;
                 }
             }

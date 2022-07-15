@@ -8,6 +8,7 @@ Current version:
 - Linux `epoll`-based event loop
 - non-blocking client sockets
 - per-connection request/response buffers
+- min-heap timer queue for delayed responses
 - routes: `/health`, `/metrics`, `/echo`, `/slow`
 
 ## Build
