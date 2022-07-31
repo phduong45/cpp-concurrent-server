@@ -1,3 +1,4 @@
+#include "blocking_queue.h"
 #include "http.h"
 #include "net_utils.h"
 
@@ -9,12 +10,14 @@
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
-#include <queue>
 #include <string>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 volatile sig_atomic_t stop_requested = 0;
@@ -35,20 +38,20 @@ struct Connection {
     std::string request;
     std::string response;
     std::size_t bytes_sent = 0;
-    bool waiting_for_timer = false;
-    std::uint64_t timer_id = 0;
+    bool waiting_for_worker = false;
+    std::uint64_t task_id = 0;
 };
 
-struct Timer {
-    std::chrono::steady_clock::time_point ready_at;
+struct RequestTask {
     int fd;
     std::uint64_t id;
+    std::string request;
 };
 
-struct TimerLater {
-    bool operator()(const Timer& left, const Timer& right) const {
-        return left.ready_at > right.ready_at;
-    }
+struct CompletedResponse {
+    int fd;
+    std::uint64_t id;
+    std::string response;
 };
 
 std::string make_metrics_body(const ServerMetrics& metrics) {
@@ -97,7 +100,7 @@ bool update_epoll_interest(int epoll_fd, const Connection& connection) {
 
     if (connection.bytes_sent < connection.response.size()) {
         event.events |= EPOLLOUT;
-    } else if (!connection.waiting_for_timer) {
+    } else if (!connection.waiting_for_worker) {
         event.events |= EPOLLIN;
     }
 
@@ -216,10 +219,85 @@ bool write_pending_data(Connection& connection) {
     return true;
 }
 
-using TimerQueue = std::priority_queue<Timer, std::vector<Timer>, TimerLater>;
+bool notify_event_loop(int event_fd) {
+    std::uint64_t value = 1;
+
+    while (true) {
+        ssize_t bytes_written = write(event_fd, &value, sizeof(value));
+        if (bytes_written == sizeof(value)) {
+            return true;
+        }
+
+        if (bytes_written == -1 && errno == EINTR) {
+            continue;
+        }
+
+        return false;
+    }
+}
+
+void drain_eventfd(int event_fd) {
+    std::uint64_t value = 0;
+
+    while (true) {
+        ssize_t bytes_read = read(event_fd, &value, sizeof(value));
+        if (bytes_read == sizeof(value)) {
+            continue;
+        }
+
+        if (bytes_read == -1 && errno == EINTR) {
+            continue;
+        }
+
+        if (bytes_read == -1 &&
+            (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+
+        return;
+    }
+}
+
+void worker_loop(BlockingQueue<RequestTask>& tasks,
+                 BlockingQueue<CompletedResponse>& completed, int event_fd) {
+    while (auto task = tasks.wait_and_pop()) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        completed.push(CompletedResponse{
+            task->fd, task->id, make_http_response("200 OK", "slow OK")});
+        notify_event_loop(event_fd);
+    }
+}
+
+void drain_completed_responses(
+    int epoll_fd, std::unordered_map<int, Connection>& connections,
+    BlockingQueue<CompletedResponse>& completed) {
+    while (auto result = completed.try_pop()) {
+        auto it = connections.find(result->fd);
+        if (it == connections.end()) {
+            continue;
+        }
+
+        Connection& connection = it->second;
+        if (!connection.waiting_for_worker ||
+            connection.task_id != result->id) {
+            continue;
+        }
+
+        connection.response = std::move(result->response);
+        connection.bytes_sent = 0;
+        connection.waiting_for_worker = false;
+
+        if (!update_epoll_interest(epoll_fd, connection)) {
+            std::cerr << "epoll update failed: " << std::strerror(errno)
+                      << "\n";
+        }
+    }
+}
 
 std::string route_request(Connection& connection, ServerMetrics& metrics,
-                          TimerQueue& timers, std::uint64_t& next_timer_id) {
+                          BlockingQueue<RequestTask>& tasks,
+                          std::uint64_t& next_task_id) {
     metrics.total_requests.fetch_add(1);
 
     auto parsed = parse_request_line(connection.request);
@@ -234,12 +312,15 @@ std::string route_request(Connection& connection, ServerMetrics& metrics,
     }
 
     if (parsed && parsed->method == "GET" && parsed->path == "/slow") {
+        connection.waiting_for_worker = true;
+        connection.task_id = next_task_id++;
+        if (!tasks.push(RequestTask{connection.fd, connection.task_id,
+                                    std::move(connection.request)})) {
+            connection.waiting_for_worker = false;
+            return make_http_response("503 Service Unavailable",
+                                      "Server shutting down");
+        }
         metrics.status_200.fetch_add(1);
-        connection.waiting_for_timer = true;
-        connection.timer_id = next_timer_id++;
-        timers.push(Timer{std::chrono::steady_clock::now() +
-                              std::chrono::seconds(2),
-                          connection.fd, connection.timer_id});
         return {};
     }
 
@@ -250,51 +331,6 @@ std::string route_request(Connection& connection, ServerMetrics& metrics,
 
     metrics.status_404.fetch_add(1);
     return make_http_response("404 Not Found", "Not Found");
-}
-
-void process_expired_timers(int epoll_fd,
-                            std::unordered_map<int, Connection>& connections,
-                            TimerQueue& timers) {
-    auto now = std::chrono::steady_clock::now();
-
-    while (!timers.empty() && timers.top().ready_at <= now) {
-        Timer timer = timers.top();
-        timers.pop();
-
-        auto it = connections.find(timer.fd);
-        if (it == connections.end()) {
-            continue;
-        }
-
-        Connection& connection = it->second;
-        if (!connection.waiting_for_timer || connection.timer_id != timer.id) {
-            continue;
-        }
-
-        connection.response = make_http_response("200 OK", "slow OK");
-        connection.bytes_sent = 0;
-        connection.waiting_for_timer = false;
-
-        if (!update_epoll_interest(epoll_fd, connection)) {
-            std::cerr << "epoll update failed: " << std::strerror(errno)
-                      << "\n";
-        }
-    }
-}
-
-int next_epoll_timeout(const TimerQueue& timers) {
-    if (timers.empty()) {
-        return -1;
-    }
-
-    auto now = std::chrono::steady_clock::now();
-    if (timers.top().ready_at <= now) {
-        return 0;
-    }
-
-    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-        timers.top().ready_at - now);
-    return static_cast<int>(remaining.count());
 }
 
 int main() {
@@ -326,12 +362,33 @@ int main() {
         return 1;
     }
 
+    int event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (event_fd == -1) {
+        std::cerr << "eventfd failed: " << std::strerror(errno) << "\n";
+        close(epoll_fd);
+        close(socket_fd);
+        return 1;
+    }
+
     epoll_event listen_event{};
     listen_event.data.fd = socket_fd;
     listen_event.events = EPOLLIN;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &listen_event) == -1) {
         std::cerr << "epoll add listen socket failed: " << std::strerror(errno)
                   << "\n";
+        close(event_fd);
+        close(epoll_fd);
+        close(socket_fd);
+        return 1;
+    }
+
+    epoll_event worker_event{};
+    worker_event.data.fd = event_fd;
+    worker_event.events = EPOLLIN;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event_fd, &worker_event) == -1) {
+        std::cerr << "epoll add eventfd failed: " << std::strerror(errno)
+                  << "\n";
+        close(event_fd);
         close(epoll_fd);
         close(socket_fd);
         return 1;
@@ -339,17 +396,23 @@ int main() {
 
     std::cout << "server listening on 127.0.0.1:8080 (epoll)\n";
 
+    BlockingQueue<RequestTask> task_queue;
+    BlockingQueue<CompletedResponse> completed_queue;
+    std::vector<std::thread> workers;
+    constexpr int worker_count = 4;
+    for (int i = 0; i < worker_count; ++i) {
+        workers.emplace_back([&] {
+            worker_loop(task_queue, completed_queue, event_fd);
+        });
+    }
+
     std::unordered_map<int, Connection> connections;
     ServerMetrics metrics;
     std::vector<epoll_event> events(64);
-    TimerQueue timers;
-    std::uint64_t next_timer_id = 1;
+    std::uint64_t next_task_id = 1;
 
     while (!stop_requested) {
-        process_expired_timers(epoll_fd, connections, timers);
-
-        int ready = epoll_wait(epoll_fd, events.data(), events.size(),
-                               next_epoll_timeout(timers));
+        int ready = epoll_wait(epoll_fd, events.data(), events.size(), -1);
         if (ready == -1) {
             if (errno == EINTR) {
                 continue;
@@ -364,6 +427,13 @@ int main() {
         for (int i = 0; i < ready; ++i) {
             int fd = events[i].data.fd;
             uint32_t event_flags = events[i].events;
+
+            if (fd == event_fd) {
+                drain_eventfd(event_fd);
+                drain_completed_responses(epoll_fd, connections,
+                                          completed_queue);
+                continue;
+            }
 
             if (fd == socket_fd) {
                 if (event_flags & EPOLLIN) {
@@ -393,8 +463,8 @@ int main() {
 
                 if (request_complete(connection.request)) {
                     connection.response =
-                        route_request(connection, metrics, timers,
-                                      next_timer_id);
+                        route_request(connection, metrics, task_queue,
+                                      next_task_id);
                     connection.bytes_sent = 0;
                 }
             }
@@ -425,6 +495,15 @@ int main() {
         close(fd);
     }
 
+    task_queue.close();
+    for (auto& worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    completed_queue.close();
+
+    close(event_fd);
     close(epoll_fd);
     close(socket_fd);
     return 0;

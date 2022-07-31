@@ -8,7 +8,8 @@ Current version:
 - Linux `epoll`-based event loop
 - non-blocking client sockets
 - per-connection request/response buffers
-- min-heap timer queue for delayed responses
+- worker pool for delayed responses
+- `eventfd` wakeup when workers finish
 - routes: `/health`, `/metrics`, `/echo`, `/slow`
 
 ## Build
@@ -37,7 +38,7 @@ Smoke test, with `./server` already running:
 ./scripts/smoke_test.sh
 ```
 
-`/slow` uses timer state instead of blocking the event loop:
+`/slow` runs in the worker pool instead of blocking the event loop:
 
 ```bash
 time sh -c 'for i in $(seq 1 8); do curl -s http://127.0.0.1:8080/slow >/dev/null & done; wait'

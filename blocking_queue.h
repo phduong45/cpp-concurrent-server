@@ -4,6 +4,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <utility>
 
 template <typename T>
 class BlockingQueue {
@@ -32,6 +33,18 @@ class BlockingQueue {
         queue_.pop();
         return item;
     }
+
+    std::optional<T> try_pop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            return std::nullopt;
+        }
+
+        T item = std::move(queue_.front());
+        queue_.pop();
+        return item;
+    }
+
     void close() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
