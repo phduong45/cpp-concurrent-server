@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -9,10 +10,12 @@
 template <typename T>
 class BlockingQueue {
   public:
+    explicit BlockingQueue(std::size_t max_size = 0) : max_size_(max_size) {}
+
     bool push(T value) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (closed_) {
+            if (closed_ || full()) {
                 return false;
             }
             queue_.push(std::move(value));
@@ -57,5 +60,10 @@ class BlockingQueue {
     std::mutex mutex_;
     std::condition_variable cv_;
     std::queue<T> queue_;
+    std::size_t max_size_;
     bool closed_ = false;
+
+    bool full() const {
+        return max_size_ != 0 && queue_.size() >= max_size_;
+    }
 };

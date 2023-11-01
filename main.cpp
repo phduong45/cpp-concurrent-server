@@ -31,6 +31,7 @@ struct ServerMetrics {
     std::atomic<std::size_t> active_connections{0};
     std::atomic<std::size_t> status_200{0};
     std::atomic<std::size_t> status_404{0};
+    std::atomic<std::size_t> status_503{0};
 };
 
 struct Connection {
@@ -62,6 +63,7 @@ std::string make_metrics_body(const ServerMetrics& metrics) {
             std::to_string(metrics.active_connections.load()) + "\n";
     body += "status_200 " + std::to_string(metrics.status_200.load()) + "\n";
     body += "status_404 " + std::to_string(metrics.status_404.load()) + "\n";
+    body += "status_503 " + std::to_string(metrics.status_503.load()) + "\n";
     return body;
 }
 
@@ -317,8 +319,9 @@ std::string route_request(Connection& connection, ServerMetrics& metrics,
         if (!tasks.push(RequestTask{connection.fd, connection.task_id,
                                     std::move(connection.request)})) {
             connection.waiting_for_worker = false;
+            metrics.status_503.fetch_add(1);
             return make_http_response("503 Service Unavailable",
-                                      "Server shutting down");
+                                      "Server busy");
         }
         metrics.status_200.fetch_add(1);
         return {};
@@ -396,7 +399,7 @@ int main() {
 
     std::cout << "server listening on 127.0.0.1:8080 (epoll)\n";
 
-    BlockingQueue<RequestTask> task_queue;
+    BlockingQueue<RequestTask> task_queue(128);
     BlockingQueue<CompletedResponse> completed_queue;
     std::vector<std::thread> workers;
     constexpr int worker_count = 4;

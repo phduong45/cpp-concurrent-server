@@ -9,6 +9,7 @@ Current version:
 - non-blocking client sockets
 - per-connection request/response buffers
 - worker pool for delayed responses
+- bounded worker queue for backpressure
 - `eventfd` wakeup when workers finish
 - routes: `/health`, `/metrics`, `/echo`, `/slow`
 
