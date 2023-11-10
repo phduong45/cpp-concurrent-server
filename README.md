@@ -11,6 +11,7 @@ Current version:
 - worker pool for delayed responses
 - bounded worker queue for backpressure
 - `eventfd` wakeup when workers finish
+- signal-aware shutdown path
 - routes: `/health`, `/metrics`, `/echo`, `/slow`
 
 ## Build

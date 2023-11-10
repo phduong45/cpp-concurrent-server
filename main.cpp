@@ -21,9 +21,18 @@
 #include <vector>
 
 volatile sig_atomic_t stop_requested = 0;
+volatile sig_atomic_t wake_event_fd = -1;
 
 void handle_signal(int) {
+    int saved_errno = errno;
     stop_requested = 1;
+
+    if (wake_event_fd != -1) {
+        std::uint64_t value = 1;
+        write(static_cast<int>(wake_event_fd), &value, sizeof(value));
+    }
+
+    errno = saved_errno;
 }
 
 struct ServerMetrics {
@@ -297,6 +306,14 @@ void drain_completed_responses(
     }
 }
 
+void join_workers(std::vector<std::thread>& workers) {
+    for (auto& worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
 std::string route_request(Connection& connection, ServerMetrics& metrics,
                           BlockingQueue<RequestTask>& tasks,
                           std::uint64_t& next_task_id) {
@@ -372,6 +389,7 @@ int main() {
         close(socket_fd);
         return 1;
     }
+    wake_event_fd = event_fd;
 
     epoll_event listen_event{};
     listen_event.data.fd = socket_fd;
@@ -379,6 +397,7 @@ int main() {
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &listen_event) == -1) {
         std::cerr << "epoll add listen socket failed: " << std::strerror(errno)
                   << "\n";
+        wake_event_fd = -1;
         close(event_fd);
         close(epoll_fd);
         close(socket_fd);
@@ -391,6 +410,7 @@ int main() {
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event_fd, &worker_event) == -1) {
         std::cerr << "epoll add eventfd failed: " << std::strerror(errno)
                   << "\n";
+        wake_event_fd = -1;
         close(event_fd);
         close(epoll_fd);
         close(socket_fd);
@@ -435,6 +455,9 @@ int main() {
                 drain_eventfd(event_fd);
                 drain_completed_responses(epoll_fd, connections,
                                           completed_queue);
+                if (stop_requested) {
+                    break;
+                }
                 continue;
             }
 
@@ -494,18 +517,17 @@ int main() {
         }
     }
 
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, socket_fd, nullptr);
+    task_queue.close();
+    join_workers(workers);
+    drain_completed_responses(epoll_fd, connections, completed_queue);
+    completed_queue.close();
+
     for (auto& [fd, connection] : connections) {
         close(fd);
     }
 
-    task_queue.close();
-    for (auto& worker : workers) {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-    completed_queue.close();
-
+    wake_event_fd = -1;
     close(event_fd);
     close(epoll_fd);
     close(socket_fd);
