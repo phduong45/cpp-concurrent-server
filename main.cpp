@@ -66,6 +66,7 @@ struct CompletedResponse {
 
 std::string make_metrics_body(const ServerMetrics& metrics) {
     std::string body;
+    body += "process_id " + std::to_string(getpid()) + "\n";
     body += "total_requests " + std::to_string(metrics.total_requests.load()) +
             "\n";
     body += "active_connections " +
@@ -81,6 +82,13 @@ bool bind_and_listen(int socket_fd, int port) {
     if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) ==
         -1) {
         std::cerr << "setsockopt SO_REUSEADDR failed: " << std::strerror(errno)
+                  << "\n";
+        return false;
+    }
+
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) ==
+        -1) {
+        std::cerr << "setsockopt SO_REUSEPORT failed: " << std::strerror(errno)
                   << "\n";
         return false;
     }
@@ -417,7 +425,8 @@ int main() {
         return 1;
     }
 
-    std::cout << "server listening on 127.0.0.1:8080 (epoll)\n";
+    std::cout << "server listening on 127.0.0.1:8080 (epoll, pid "
+              << getpid() << ")\n";
 
     BlockingQueue<RequestTask> task_queue(128);
     BlockingQueue<CompletedResponse> completed_queue;

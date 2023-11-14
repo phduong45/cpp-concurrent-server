@@ -11,6 +11,7 @@ Current version:
 - worker pool for delayed responses
 - bounded worker queue for backpressure
 - `eventfd` wakeup when workers finish
+- `SO_REUSEPORT` for multi-process worker mode
 - signal-aware shutdown path
 - routes: `/health`, `/metrics`, `/echo`, `/slow`
 
@@ -23,6 +24,16 @@ make clean && make
 ## Run
 
 ```bash
+./server
+```
+
+Multiple server processes can bind the same port through `SO_REUSEPORT`:
+
+```bash
+# terminal 1
+./server
+
+# terminal 2
 ./server
 ```
 
