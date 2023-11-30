@@ -12,6 +12,7 @@ Current version:
 - bounded worker queue for backpressure
 - `eventfd` wakeup when workers finish
 - `SO_REUSEPORT` for multi-process worker mode
+- request deadlines for slow worker tasks
 - signal-aware shutdown path
 - routes: `/health`, `/metrics`, `/echo`, `/slow`
 
@@ -51,10 +52,13 @@ Smoke test, with `./server` already running:
 ./scripts/smoke_test.sh
 ```
 
-`/slow` runs in the worker pool instead of blocking the event loop:
+`/slow` runs in the worker pool and has a request deadline:
 
 ```bash
 time sh -c 'for i in $(seq 1 8); do curl -s http://127.0.0.1:8080/slow >/dev/null & done; wait'
 ```
+
+The demo worker sleeps for 2s while the request deadline is 1s, so `/slow`
+returns `504 Gateway Timeout`.
 
 Limitations: minimal HTTP parsing, no keep-alive, no TLS, and Linux `epoll`.

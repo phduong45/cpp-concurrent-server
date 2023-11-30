@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
+#include <queue>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -41,6 +42,7 @@ struct ServerMetrics {
     std::atomic<std::size_t> status_200{0};
     std::atomic<std::size_t> status_404{0};
     std::atomic<std::size_t> status_503{0};
+    std::atomic<std::size_t> status_504{0};
 };
 
 struct Connection {
@@ -64,6 +66,21 @@ struct CompletedResponse {
     std::string response;
 };
 
+struct Deadline {
+    std::chrono::steady_clock::time_point expires_at;
+    int fd;
+    std::uint64_t task_id;
+};
+
+struct DeadlineLater {
+    bool operator()(const Deadline& left, const Deadline& right) const {
+        return left.expires_at > right.expires_at;
+    }
+};
+
+using DeadlineQueue =
+    std::priority_queue<Deadline, std::vector<Deadline>, DeadlineLater>;
+
 std::string make_metrics_body(const ServerMetrics& metrics) {
     std::string body;
     body += "process_id " + std::to_string(getpid()) + "\n";
@@ -74,6 +91,7 @@ std::string make_metrics_body(const ServerMetrics& metrics) {
     body += "status_200 " + std::to_string(metrics.status_200.load()) + "\n";
     body += "status_404 " + std::to_string(metrics.status_404.load()) + "\n";
     body += "status_503 " + std::to_string(metrics.status_503.load()) + "\n";
+    body += "status_504 " + std::to_string(metrics.status_504.load()) + "\n";
     return body;
 }
 
@@ -290,7 +308,7 @@ void worker_loop(BlockingQueue<RequestTask>& tasks,
 
 void drain_completed_responses(
     int epoll_fd, std::unordered_map<int, Connection>& connections,
-    BlockingQueue<CompletedResponse>& completed) {
+    BlockingQueue<CompletedResponse>& completed, ServerMetrics& metrics) {
     while (auto result = completed.try_pop()) {
         auto it = connections.find(result->fd);
         if (it == connections.end()) {
@@ -306,12 +324,61 @@ void drain_completed_responses(
         connection.response = std::move(result->response);
         connection.bytes_sent = 0;
         connection.waiting_for_worker = false;
+        metrics.status_200.fetch_add(1);
 
         if (!update_epoll_interest(epoll_fd, connection)) {
             std::cerr << "epoll update failed: " << std::strerror(errno)
                       << "\n";
         }
     }
+}
+
+void process_expired_deadlines(
+    int epoll_fd, std::unordered_map<int, Connection>& connections,
+    DeadlineQueue& deadlines, ServerMetrics& metrics) {
+    auto now = std::chrono::steady_clock::now();
+
+    while (!deadlines.empty() && deadlines.top().expires_at <= now) {
+        Deadline deadline = deadlines.top();
+        deadlines.pop();
+
+        auto it = connections.find(deadline.fd);
+        if (it == connections.end()) {
+            continue;
+        }
+
+        Connection& connection = it->second;
+        if (!connection.waiting_for_worker ||
+            connection.task_id != deadline.task_id) {
+            continue;
+        }
+
+        connection.response =
+            make_http_response("504 Gateway Timeout", "Gateway Timeout");
+        connection.bytes_sent = 0;
+        connection.waiting_for_worker = false;
+        metrics.status_504.fetch_add(1);
+
+        if (!update_epoll_interest(epoll_fd, connection)) {
+            std::cerr << "epoll update failed: " << std::strerror(errno)
+                      << "\n";
+        }
+    }
+}
+
+int next_deadline_timeout(const DeadlineQueue& deadlines) {
+    if (deadlines.empty()) {
+        return -1;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (deadlines.top().expires_at <= now) {
+        return 0;
+    }
+
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadlines.top().expires_at - now);
+    return static_cast<int>(remaining.count());
 }
 
 void join_workers(std::vector<std::thread>& workers) {
@@ -324,6 +391,7 @@ void join_workers(std::vector<std::thread>& workers) {
 
 std::string route_request(Connection& connection, ServerMetrics& metrics,
                           BlockingQueue<RequestTask>& tasks,
+                          DeadlineQueue& deadlines,
                           std::uint64_t& next_task_id) {
     metrics.total_requests.fetch_add(1);
 
@@ -348,7 +416,10 @@ std::string route_request(Connection& connection, ServerMetrics& metrics,
             return make_http_response("503 Service Unavailable",
                                       "Server busy");
         }
-        metrics.status_200.fetch_add(1);
+
+        deadlines.push(Deadline{std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(1),
+                                connection.fd, connection.task_id});
         return {};
     }
 
@@ -441,10 +512,14 @@ int main() {
     std::unordered_map<int, Connection> connections;
     ServerMetrics metrics;
     std::vector<epoll_event> events(64);
+    DeadlineQueue deadlines;
     std::uint64_t next_task_id = 1;
 
     while (!stop_requested) {
-        int ready = epoll_wait(epoll_fd, events.data(), events.size(), -1);
+        process_expired_deadlines(epoll_fd, connections, deadlines, metrics);
+
+        int ready = epoll_wait(epoll_fd, events.data(), events.size(),
+                               next_deadline_timeout(deadlines));
         if (ready == -1) {
             if (errno == EINTR) {
                 continue;
@@ -463,7 +538,7 @@ int main() {
             if (fd == event_fd) {
                 drain_eventfd(event_fd);
                 drain_completed_responses(epoll_fd, connections,
-                                          completed_queue);
+                                          completed_queue, metrics);
                 if (stop_requested) {
                     break;
                 }
@@ -499,7 +574,7 @@ int main() {
                 if (request_complete(connection.request)) {
                     connection.response =
                         route_request(connection, metrics, task_queue,
-                                      next_task_id);
+                                      deadlines, next_task_id);
                     connection.bytes_sent = 0;
                 }
             }
@@ -529,7 +604,7 @@ int main() {
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, socket_fd, nullptr);
     task_queue.close();
     join_workers(workers);
-    drain_completed_responses(epoll_fd, connections, completed_queue);
+    drain_completed_responses(epoll_fd, connections, completed_queue, metrics);
     completed_queue.close();
 
     for (auto& [fd, connection] : connections) {
