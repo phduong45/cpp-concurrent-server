@@ -52,6 +52,13 @@ Smoke test, with `./server` already running:
 ./scripts/smoke_test.sh
 ```
 
+Small load test:
+
+```bash
+./scripts/load_test.sh /health 1000 50
+./scripts/load_test.sh /slow 100 20
+```
+
 `/slow` runs in the worker pool and has a request deadline:
 
 ```bash
