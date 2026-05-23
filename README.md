@@ -16,6 +16,39 @@ Current version:
 - signal-aware shutdown path
 - routes: `/health`, `/metrics`, `/echo`, `/slow`
 
+## Architecture
+
+```text
+Client
+  |
+  v
+Listening Socket
+  |
+  v
+Event Loop (epoll)
+  |
+  +--> fast routes: /health, /metrics, /echo
+  |
+  +--> BlockingQueue<RequestTask>
+            |
+            v
+        Worker Threads
+            |
+            v
+      CompletedResponse Queue
+            |
+            v
+        eventfd wakeup
+            |
+            v
+Event Loop writes HTTP response
+```
+
+The event loop owns all sockets and `Connection` objects. Worker threads never
+read or write client sockets directly; they process `RequestTask` objects and
+hand `CompletedResponse` objects back to the event loop through a queue plus
+`eventfd`.
+
 ## Build
 
 ```bash
